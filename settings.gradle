@@ -1,0 +1,3 @@
+rootProject.name = 'idea-publish'
+
+ideaComponents.split(',').each {c -> include c }

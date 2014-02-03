@@ -1,0 +1,251 @@
+buildscript {
+    repositories {
+        mavenCentral()
+    }
+
+    dependencies {
+        classpath("org.apache.maven:maven-model:3.0.3") { transitive = false }
+    }
+}
+
+allprojects {
+    apply plugin: 'maven-publish'
+
+    publishing {
+        repositories {
+            maven {
+                credentials {
+                    username repositoryUser
+                    password repositoryPassword
+                }
+                url repositoryURL
+            }
+        }
+    }
+
+    project.ext {
+        platforms = ['linux', 'mac', 'win']
+    }
+}
+
+// FIXME: determine if we can detect one version from another!
+// Sample matching pairs:
+// ideaVersion    version
+// 12.1.2         IC-129.354
+
+if (!hasProperty('ideaVersion')) {
+    throw new InvalidUserDataException("You must specify IDEA version using -PideaVersion= !")
+}
+if (version == 'unspecified') {
+    throw new InvalidUserDataException("You must specify version using -Pversion= ! " +
+            "Version should match value in build.txt inside the IDEA installation")
+}
+
+task sources(type: DownloadAndExtractTask) {
+    fileName = "ideaIC-${project.ideaVersion}-src.tar.bz2"
+}
+
+task binaries(type: DownloadAndExtractTask) {
+    fileName = "ideaIC-${project.ideaVersion}.tar.gz"
+    prefix = "idea-"
+}
+
+project(':native') {
+    group = 'com.jetbrains.intellij.ideace'
+
+    platforms.each { def platform ->
+        def archiveName = "native-${version}-${platform}"
+
+        tasks.create(name: "native${platform.capitalize()}Zip", type: Zip, dependsOn: sources) {
+            from(new File(sources.directory, "bin/${platform}"))
+            destinationDir = file('build/')
+            baseName = archiveName
+        }
+    }
+
+    publishing {
+        publications {
+            natives(MavenPublication) {
+                platforms.each {
+                    def platform -> artifact "native${platform.capitalize()}Zip" {
+                        classifier platform
+                        extension 'zip'
+                    }
+                }
+                pom.withXml {
+                    asNode().appendNode('description', 'IDEA CE native libraries')
+                }
+            }
+        }
+    }
+}
+
+project(':ideace') {
+    group = 'com.jetbrains.intellij.ideace'
+
+    publishing {
+        publications {
+            binary(MavenPublication) {
+                artifact(source: binaries.archive) {
+                    classifier 'linux'
+                    extension 'tar.gz'
+                }
+                artifact(source: sources.archive) {
+                    classifier 'src'
+                    extension 'tar.bz2'
+                }
+                pom.withXml {
+                    asNode().appendNode('description', 'IDEA CE')
+                }
+            }
+        }
+    }
+}
+
+allprojects {
+    if (project.name == 'ideace' || project.name == 'native' || project.name == rootProject.name) return
+
+    project.ext {
+        groupId = 'com.jetbrains.intellij.' + (project.name != 'platform' ? 'plugins.' : '') + project.name
+        directory = new File(binaries.directory, project.name == 'platform' ? 'lib' : 'plugins/' + project.name + '/lib')
+    }
+
+    apply plugin: 'maven'
+
+    configurations {
+        jars
+    }
+
+    task discoverJars(dependsOn: binaries) {
+        ext.discoveredFiles = []
+        doLast {
+            def deps = []
+
+            file(directory).eachFile { file ->
+                if (file.name.endsWith("jar")) {
+                    def artifactId = file.name - ".jar"
+                    artifactId = artifactId.replaceAll('SNAPSHOT', 'snapshot')
+                    discoveredFiles <<
+                            [groupId: groupId,
+                             artifactId: artifactId,
+                             id: "${groupId}_${artifactId}",
+                             file: file]
+                    deps << "${groupId}:${artifactId}:${project.version}"
+                    artifacts {
+                        jars file
+                    }
+                }
+            }
+
+            // Add SDK POM. Create empty POM to force Gradle to upload it.
+            def file = new File(directory, 'sdk.pom')
+            new FileOutputStream(file).close() // create file
+            discoveredFiles <<
+                    [groupId: groupId,
+                     artifactId: 'sdk',
+                     id: "${groupId}_sdk",
+                     file: file,
+                     description: "IntelliJ ${project.name} SDK",
+                     dependencies: deps]
+
+            artifacts {
+                jars file
+            }
+        }
+    }
+
+    task configureUploadJars(dependsOn: discoverJars) {
+        doLast {
+            uploadJars {
+                repositories {
+                    mavenDeployer {
+                        repository(url: repositoryURL) {
+                            authentication(userName: repositoryUser, password: repositoryPassword)
+                        }
+                        discoverJars.discoveredFiles.each { art ->
+                            addFilter(art.id) { artifact, file -> file == art.file }
+                            pom(art.id) {
+                                artifactId = art.artifactId
+                                groupId = art.groupId
+
+                                withXml {
+                                    if (art.description != null) {
+                                        asNode().appendNode('description', art.description)
+                                    }
+
+                                    if (art.dependencies != null) {
+                                        def deps = asNode().appendNode('dependencies')
+
+                                        art.dependencies.each {
+                                            dep ->
+                                                def node = deps.appendNode('dependency')
+                                                def gav = dep.split(":")
+                                                node.appendNode('groupId', gav[0])
+                                                node.appendNode('artifactId', gav[1])
+                                                node.appendNode('version', gav[2])
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    uploadJars.dependsOn configureUploadJars
+
+    publish.dependsOn uploadJars
+}
+
+
+tasks['publish'].configure {
+    dependsOn binaries, sources // required by ideace:binary publication
+    outputs.upToDateWhen { false }
+}
+
+task wrapper(type: Wrapper) {
+    gradleVersion = '1.7'
+}
+
+class DownloadAndExtractTask extends DefaultTask {
+    def String fileName
+    def File downloadsDir = project.file('build/downloads')
+    def prefix = "idea"
+
+    DownloadAndExtractTask() {
+        outputs.upToDateWhen { archive.exists() }
+    }
+
+    String getUrl() {
+        return "http://download.jetbrains.com/idea/${fileName}"
+    }
+
+    File getArchive() {
+        return new File(downloadsDir, fileName)
+    }
+
+    File getDestDir() {
+        return project.file("build/${fileName}")
+    }
+
+    String getDirectory() {
+        return new File(destDir, prefix + project.version)
+    }
+
+    @TaskAction
+    def greet() {
+        println "Downloading ${url} into ${downloadsDir}..."
+        ant.mkdir(dir: downloadsDir)
+        ant.get(src: url,
+                dest: downloadsDir,
+                skipexisting: true,
+                verbose: true)
+
+        println "Extracting into ${destDir}"
+        ant.untar(src: archive,
+                  dest: destDir,
+                  compression: fileName.endsWith(".tar.bz2") ? "bzip2" : "gzip")
+    }
+}
